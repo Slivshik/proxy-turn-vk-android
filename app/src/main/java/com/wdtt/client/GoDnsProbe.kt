@@ -103,6 +103,37 @@ object GoDnsProbe {
         }
     }
 
+    /**
+     * Проверка локального DNS сети (оператора/Wi-Fi) — аварийный запасной вариант,
+     * когда все настроенные DNS (Яндекс/Cloudflare/Google/DoH/свой) недоступны.
+     */
+    suspend fun checkLocalNetworkDns(servers: List<String>, timeoutMs: Int = 2000): Result = withContext(Dispatchers.IO) {
+        if (servers.isEmpty()) {
+            return@withContext Result(
+                reachable = false,
+                title = "Локальный DNS",
+                okHosts = emptyList(),
+                failedHosts = emptyList(),
+                detail = "нет адресов",
+            )
+        }
+        coroutineScope {
+            val checks = servers.map { server ->
+                async { server to probeDnsServer(server, timeoutMs) }
+            }.awaitAll()
+
+            val okHosts = checks.filter { it.second }.map { it.first }
+            val failedHosts = checks.filter { !it.second }.map { it.first }
+            Result(
+                reachable = okHosts.isNotEmpty(),
+                title = "Локальный DNS",
+                okHosts = okHosts,
+                failedHosts = failedHosts,
+                detail = "UDP DNS $PROBE_HOST",
+            )
+        }
+    }
+
     suspend fun checkPreset(
         preset: String,
         customRaw: String = "",

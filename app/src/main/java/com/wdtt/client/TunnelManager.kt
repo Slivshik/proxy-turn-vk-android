@@ -413,15 +413,38 @@ object TunnelManager {
                         50,
                         true
                     )
-                    failConnectionPipeline(ConnectionStep.DNS)
                     updateLog(
-                        "go_dns_tip",
-                        "[СЕТЬ] Смените DNS в ⚙️ → Сеть (Яндекс / Cloudflare / Google / DoH / Свой)",
-                        50,
-                        true
+                        "go_dns_local_fallback_try",
+                        "[СЕТЬ] Пробуем локальный DNS сети (оператора/Wi-Fi)…",
+                        1,
+                        false
                     )
-                    abortStart(isSwitching, "DNS недоступен")
-                    return@launch
+                    val localServers = LocalDnsHelper.systemDnsServers(appContext)
+                    val localProbe = GoDnsProbe.checkLocalNetworkDns(localServers)
+                    if (localProbe.reachable) {
+                        val fallbackArg = "custom:" + localProbe.okHosts.joinToString(",")
+                        val dnsArgIndex = cmd.indexOf("-go-dns")
+                        if (dnsArgIndex >= 0 && dnsArgIndex + 1 < cmd.size) {
+                            cmd[dnsArgIndex + 1] = fallbackArg
+                        }
+                        updateLog(
+                            "go_dns_local_fallback_ok",
+                            "[СЕТЬ] Используется локальный DNS сети: ${localProbe.statusText}",
+                            1,
+                            false
+                        )
+                        advanceConnectionPipeline(ConnectionStep.DNS, ConnectionStep.VK)
+                    } else {
+                        failConnectionPipeline(ConnectionStep.DNS)
+                        updateLog(
+                            "go_dns_tip",
+                            "[СЕТЬ] Смените DNS в ⚙️ → Сеть (Яндекс / Cloudflare / Google / DoH / Свой)",
+                            50,
+                            true
+                        )
+                        abortStart(isSwitching, "DNS недоступен")
+                        return@launch
+                    }
                 } else {
                     updateLog("go_dns_precheck_ok", "[СЕТЬ] DNS доступен: ${dnsProbe.statusText}", 1, false)
                     advanceConnectionPipeline(ConnectionStep.DNS, ConnectionStep.VK)

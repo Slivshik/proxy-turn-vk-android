@@ -1,0 +1,39 @@
+name: Build debug APK
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go_client/go.mod
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build debug APKs
+        run: ./gradlew :app:assembleDebug --stacktrace
+        env:
+          # Android SDK/NDK on GitHub-hosted runners are pre-installed;
+          # ANDROID_NDK_HOME is already exported by the runner image.
+          ANDROID_NATIVE_API_LEVEL: 21
+
+      - name: Upload debug APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
