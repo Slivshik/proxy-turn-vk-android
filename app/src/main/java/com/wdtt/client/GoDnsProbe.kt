@@ -13,9 +13,13 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.SocketTimeoutException
 import java.net.URL
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 import kotlin.random.Random
 
 /**
@@ -23,6 +27,8 @@ import kotlin.random.Random
  */
 object GoDnsProbe {
     private const val PROBE_HOST = "login.vk.ru"
+    /** Второй домен, без которого анонимный VK-флоу не получает TURN-креды (see go_client/creds.go). */
+    private const val VK_CALLS_HOST = "calls.okcdn.ru"
     private const val DNS_PORT = 53
     private val dnsMessageType = "application/dns-message".toMediaType()
 
@@ -106,8 +112,13 @@ object GoDnsProbe {
     /**
      * Проверка локального DNS сети (оператора/Wi-Fi) — аварийный запасной вариант,
      * когда все настроенные DNS (Яндекс/Cloudflare/Google/DoH/свой) недоступны.
+     *
+     * Одного ответа на `login.vk.ru` недостаточно: провайдер может резолвить его нормально,
+     * но резать/подменять `calls.okcdn.ru` (через него анонимный VK-флоу получает TURN-креды) —
+     * тогда туннель поднимается, а воркеры зависают без трафика. Поэтому здесь помимо валидного
+     * DNS-ответа проверяется реальная TCP+TLS-доступность резолвнутого адреса `calls.okcdn.ru`.
      */
-    suspend fun checkLocalNetworkDns(servers: List<String>, timeoutMs: Int = 2000): Result = withContext(Dispatchers.IO) {
+    suspend fun checkLocalNetworkDns(servers: List<String>, timeoutMs: Int = 3000): Result = withContext(Dispatchers.IO) {
         if (servers.isEmpty()) {
             return@withContext Result(
                 reachable = false,
@@ -119,7 +130,7 @@ object GoDnsProbe {
         }
         coroutineScope {
             val checks = servers.map { server ->
-                async { server to probeDnsServer(server, timeoutMs) }
+                async { server to probeLocalServerForVk(server, timeoutMs) }
             }.awaitAll()
 
             val okHosts = checks.filter { it.second }.map { it.first }
@@ -129,9 +140,98 @@ object GoDnsProbe {
                 title = "Локальный DNS",
                 okHosts = okHosts,
                 failedHosts = failedHosts,
-                detail = "UDP DNS $PROBE_HOST",
+                detail = "$PROBE_HOST + $VK_CALLS_HOST доступны",
             )
         }
+    }
+
+    private fun probeLocalServerForVk(serverIp: String, timeoutMs: Int): Boolean {
+        if (!probeDnsServer(serverIp, timeoutMs)) return false
+        val callsIps = resolveViaServer(serverIp, VK_CALLS_HOST, timeoutMs)
+        if (callsIps.isEmpty()) return false
+        return callsIps.any { probeHttpsReachable(it, VK_CALLS_HOST, timeoutMs) }
+    }
+
+    private fun resolveViaServer(serverIp: String, hostname: String, timeoutMs: Int): List<String> {
+        return try {
+            val txId = Random.nextInt(0, 0x10000)
+            val query = buildDnsQuery(txId, hostname)
+            DatagramSocket().use { socket ->
+                socket.soTimeout = timeoutMs.coerceIn(500, 5000)
+                val addr = InetAddress.getByName(serverIp)
+                socket.send(DatagramPacket(query, query.size, addr, DNS_PORT))
+
+                val buf = ByteArray(1024)
+                val response = DatagramPacket(buf, buf.size)
+                socket.receive(response)
+                if (!validateDnsResponse(response.data, txId, response.length)) return emptyList()
+                extractARecords(response.data, response.length)
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun probeHttpsReachable(ip: String, sniHost: String, timeoutMs: Int): Boolean {
+        return try {
+            val timeout = timeoutMs.coerceIn(500, 5000)
+            Socket().use { raw ->
+                raw.connect(InetSocketAddress(ip, 443), timeout)
+                val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                (factory.createSocket(raw, sniHost, 443, true) as SSLSocket).use { ssl ->
+                    val params = ssl.sslParameters
+                    params.endpointIdentificationAlgorithm = "HTTPS"
+                    ssl.sslParameters = params
+                    ssl.soTimeout = timeout
+                    ssl.startHandshake()
+                    true
+                }
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun extractARecords(data: ByteArray, length: Int): List<String> {
+        if (length < 12) return emptyList()
+        val qdcount = ((data[4].toInt() and 0xff) shl 8) or (data[5].toInt() and 0xff)
+        val ancount = ((data[6].toInt() and 0xff) shl 8) or (data[7].toInt() and 0xff)
+
+        var offset = 12
+        repeat(qdcount) {
+            offset = skipDnsName(data, offset, length) ?: return emptyList()
+            offset += 4 // QTYPE + QCLASS
+        }
+
+        val results = mutableListOf<String>()
+        repeat(ancount) {
+            offset = skipDnsName(data, offset, length) ?: return results
+            if (offset + 10 > length) return results
+            val type = ((data[offset].toInt() and 0xff) shl 8) or (data[offset + 1].toInt() and 0xff)
+            val rdlength = ((data[offset + 8].toInt() and 0xff) shl 8) or (data[offset + 9].toInt() and 0xff)
+            offset += 10
+            if (offset + rdlength > length) return results
+            if (type == 1 && rdlength == 4) {
+                results.add(
+                    "${data[offset].toInt() and 0xff}.${data[offset + 1].toInt() and 0xff}." +
+                        "${data[offset + 2].toInt() and 0xff}.${data[offset + 3].toInt() and 0xff}"
+                )
+            }
+            offset += rdlength
+        }
+        return results
+    }
+
+    /** Пропускает DNS-имя (метки или сжатый указатель) и возвращает офсет сразу после него. */
+    private fun skipDnsName(data: ByteArray, startOffset: Int, length: Int): Int? {
+        var offset = startOffset
+        while (offset < length) {
+            val len = data[offset].toInt() and 0xff
+            if (len == 0) return offset + 1
+            if ((len and 0xC0) == 0xC0) return offset + 2
+            offset += 1 + len
+        }
+        return null
     }
 
     suspend fun checkPreset(
