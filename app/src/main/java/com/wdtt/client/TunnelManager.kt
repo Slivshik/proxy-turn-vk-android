@@ -873,9 +873,15 @@ object TunnelManager {
                             val goHint = pipeParts.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
                             // Формируем уникальный ключ ошибки на основе её типа (группируем по типу ошибки)
                             val errorKey = when {
+                                // Отмена контекста (напр. из-за таймаута DTLS в другом воркере) рвёт
+                                // и DNS-резолв в процессе — текст ошибки при этом содержит "lookup",
+                                // хотя причина не в DNS. Проверяем это раньше, чтобы не подсунуть
+                                // ложную подсказку "смените DNS".
+                                mainLine.contains("timeout", true) ||
+                                    mainLine.contains("context canceled", true) ||
+                                    mainLine.contains("operation was canceled", true) -> "err_timeout"
                                 mainLine.contains("lookup login.vk.ru", true) -> "err_vk_dns"
                                 mainLine.contains("connection refused", true) -> "err_conn_refused"
-                                mainLine.contains("timeout", true) || mainLine.contains("context canceled", true) -> "err_timeout"
                                 mainLine.contains("кредов", true) -> "err_creds"
                                 mainLine.contains("DTLS", true) -> "err_dtls"
                                 mainLine.contains("[TURN]", true) -> "err_turn"
@@ -1719,7 +1725,7 @@ object TunnelManager {
         return when {
             lower.contains("wrap_auth_timeout") || lower.contains("dtls timeout") ->
                 "Сервер не ответил на WRAP/DTLS — проверьте пароль профиля, IP/порт VPS и что wdtt-server запущен"
-            lower.contains("context canceled") ->
+            lower.contains("context canceled") || lower.contains("operation was canceled") ->
                 "Соединение прервано до handshake — часто сервер недоступен, UDP режет оператор или сменилась сеть"
             lower.contains("connection refused") ->
                 "Сервер отклонил подключение — проверьте IP, порт DTLS и что wdtt-server запущен на VPS"
